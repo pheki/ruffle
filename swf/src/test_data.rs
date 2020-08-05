@@ -3,8 +3,8 @@
 use crate::avm1::types::*;
 use crate::avm2::read::tests::read_abc_from_file;
 use crate::avm2::types::*;
-use crate::read::read_swf;
 use crate::read::tests::{read_tag_bytes_from_file, read_tag_bytes_from_file_with_index};
+use crate::read::{read_swf, read_swf_header};
 use crate::tag_code::TagCode;
 use crate::types::*;
 use crate::write::write_swf;
@@ -14,7 +14,8 @@ use std::vec::Vec;
 #[allow(dead_code)]
 pub fn echo_swf(filename: &str) {
     let in_file = File::open(filename).unwrap();
-    let swf = read_swf(in_file).unwrap();
+    let (header, data) = read_swf_header(in_file).unwrap().read_all().unwrap();
+    let swf = read_swf(header, &data).unwrap();
     let out_file = File::create(filename).unwrap();
     write_swf(&swf, out_file).unwrap();
 }

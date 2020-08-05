@@ -5,6 +5,7 @@
 //! https://www.adobe.com/content/dam/acom/en/devnet/pdf/swf-file-format-spec.pdf
 use enumset::{EnumSet, EnumSetType};
 use std::collections::HashSet;
+use std::io::Read;
 
 mod matrix;
 
@@ -23,7 +24,7 @@ pub struct Swf {
 pub struct SwfStream<'a> {
     pub header: Header,
     pub uncompressed_length: usize,
-    pub reader: crate::read::Reader<Box<dyn std::io::Read + 'a>>,
+    pub decompressed_reader: Box<dyn Read + 'a>,
 }
 
 /// The header of an SWF file.
@@ -44,7 +45,7 @@ pub struct Header {
 ///
 /// The vast majority of SWFs will use zlib compression.
 /// [SWF19 p.27](https://www.adobe.com/content/dam/acom/en/devnet/pdf/swf-file-format-spec.pdf#page=27)
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum Compression {
     None,
     Zlib,

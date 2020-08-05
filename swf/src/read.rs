@@ -10,7 +10,7 @@ use byteorder::{LittleEndian, ReadBytesExt};
 use enumset::EnumSet;
 use std::collections::HashSet;
 use std::convert::TryInto;
-use std::io::{self, Read};
+use std::io::{self, Cursor, Read};
 
 /// Convenience method to parse an SWF.
 ///
@@ -21,44 +21,14 @@ use std::io::{self, Read};
 /// # Example
 /// ```
 /// let data = std::fs::read("tests/swfs/DefineSprite.swf").unwrap();
-/// let swf = swf::read_swf(&data[..]).unwrap();
+/// let (header, data) = swf::read_swf_header(&data[..]).unwrap().read_all().unwrap();
+/// let swf = swf::read_swf(header, &data).unwrap();
 /// println!("Number of frames: {}", swf.header.num_frames);
 /// ```
-pub fn read_swf<R: Read>(input: R) -> Result<Swf> {
-    let swf_stream = read_swf_header(input)?;
-    let header = swf_stream.header;
-    let mut reader = swf_stream.reader;
-
-    // Decompress all of SWF into memory at once.
-    let mut data = if header.compression == Compression::Lzma {
-        // TODO: The LZMA decoder is still funky.
-        // It always errors, and doesn't return all the data if you use read_to_end,
-        // but read_exact at least returns the data... why?
-        // Does the decoder need to be flushed somehow?
-        let mut data = vec![0u8; swf_stream.uncompressed_length];
-        let _ = reader.get_mut().read_exact(&mut data);
-        data
-    } else {
-        let mut data = Vec::with_capacity(swf_stream.uncompressed_length);
-        if let Err(e) = reader.get_mut().read_to_end(&mut data) {
-            log::error!("Error decompressing SWF, may be corrupt: {}", e);
-        }
-        data
-    };
+pub fn read_swf(header: Header, data: &[u8]) -> Result<Swf> {
     let version = header.version;
 
-    // Some SWF streams may not be compressed correctly,
-    // (e.g. incorrect data length in the stream), so decompressing
-    // may throw an error even though the data otherwise comes
-    // through the stream.
-    // We'll still try to parse what we get if the full decompression fails.
-    if let Err(e) = reader.get_mut().read_to_end(&mut data) {
-        log::warn!("Error decompressing SWF stream, may be corrupt: {}", e);
-    }
-    if data.len() != swf_stream.uncompressed_length {
-        log::warn!("SWF length doesn't match header, may be corrupt");
-    }
-    let mut reader = Reader::new(&data[..], version);
+    let mut reader = Reader::new(&data, version);
 
     Ok(Swf {
         header,
@@ -87,7 +57,7 @@ pub fn read_swf_header<'a, R: Read + 'a>(mut input: R) -> Result<SwfStream<'a>> 
     let uncompressed_length = input.read_u32::<LittleEndian>()? - 8;
 
     // Now the SWF switches to a compressed stream.
-    let decompressed_input: Box<dyn Read> = match compression {
+    let mut decompressed_reader: Box<dyn Read> = match compression {
         Compression::None => Box::new(input),
         Compression::Zlib => {
             if version < 6 {
@@ -109,10 +79,12 @@ pub fn read_swf_header<'a, R: Read + 'a>(mut input: R) -> Result<SwfStream<'a>> 
         }
     };
 
-    let mut reader = Reader::new(decompressed_input, version);
-    let stage_size = reader.read_rectangle()?;
-    let frame_rate = reader.read_fixed8()?;
-    let num_frames = reader.read_u16()?;
+    let stage_size = parse_rect(&mut decompressed_reader)?;
+    let frame_rate = decompressed_reader
+        .read_i16::<LittleEndian>()
+        .map(|n| f32::from(n) / 256f32)?;
+    let num_frames = decompressed_reader.read_u16::<LittleEndian>()?;
+
     let header = Header {
         version,
         compression,
@@ -120,10 +92,11 @@ pub fn read_swf_header<'a, R: Read + 'a>(mut input: R) -> Result<SwfStream<'a>> 
         frame_rate,
         num_frames,
     };
+
     Ok(SwfStream {
         header,
         uncompressed_length: uncompressed_length.try_into().unwrap(),
-        reader,
+        decompressed_reader,
     })
 }
 
@@ -203,6 +176,71 @@ fn make_lzma_reader<'a, R: Read + 'a>(
     ))
 }
 
+fn parse_rect(reader: &mut impl Read) -> Result<Rectangle> {
+    let mut byte = reader.read_u8()?;
+    let n_bits = (byte & 0b1111_1000) >> 3;
+    let mut bit_index = 7 - 5;
+
+    let mut values = [0; 4];
+    for i in 0..4 {
+        let mut current_value = 0i32;
+        for _ in 0..n_bits {
+            if current_value < 8 {
+                current_value <<= current_value;
+            } else {
+                current_value = 0;
+            }
+            if byte & (1 << bit_index) != 0 {
+                current_value += 1;
+            }
+            if bit_index == 0 {
+                bit_index = 8;
+                byte = reader.read_u8()?;
+            }
+            bit_index -= 1;
+        }
+        values[i] = current_value;
+    }
+    Ok(Rectangle {
+        x_min: Twips::new(values[0]),
+        x_max: Twips::new(values[1]),
+        y_min: Twips::new(values[2]),
+        y_max: Twips::new(values[3]),
+    })
+}
+
+impl SwfStream<'_> {
+    pub fn read_all(mut self) -> Result<(Header, Vec<u8>)> {
+        // Decompress all of SWF into memory at once.
+        let decompressed_input = if self.header.compression == Compression::Lzma {
+            // TODO: The LZMA decoder is still funky.
+            // It always errors, and doesn't return all the data if you use read_to_end,
+            // but read_exact at least returns the data... why?
+            // Does the decoder need to be flushed somehow?
+            let mut data = vec![0u8; self.uncompressed_length as usize];
+            let _ = self.decompressed_reader.read_exact(&mut data);
+            data
+        } else {
+            let mut data = Vec::with_capacity(self.uncompressed_length as usize);
+            if let Err(e) = self.decompressed_reader.read_to_end(&mut data) {
+                log::error!("Error decompressing SWF, may be corrupt: {}", e);
+            }
+            data
+        };
+
+        // Some SWF streams may not be compressed correctly,
+        // (e.g. incorrect data length in the stream), so decompressing
+        // may throw an error even though the data otherwise comes
+        // through the stream.
+        // We'll still try to parse what we get if the full decompression fails.
+        if decompressed_input.len() != self.uncompressed_length as usize {
+            log::warn!("SWF length doesn't match header, may be corrupt");
+        }
+
+        Ok((self.header, decompressed_input))
+    }
+}
+
 pub trait SwfRead<R: Read> {
     fn get_inner(&mut self) -> &mut R;
 
@@ -273,8 +311,8 @@ pub trait SwfRead<R: Read> {
     }
 }
 
-pub struct Reader<R: Read> {
-    input: R,
+pub struct Reader<'a> {
+    input: Cursor<&'a [u8]>,
     version: u8,
 
     byte: u8,
@@ -284,8 +322,8 @@ pub struct Reader<R: Read> {
     num_line_bits: u8,
 }
 
-impl<R: Read> SwfRead<R> for Reader<R> {
-    fn get_inner(&mut self) -> &mut R {
+impl<'a> SwfRead<Cursor<&'a [u8]>> for Reader<'a> {
+    fn get_inner(&mut self) -> &mut Cursor<&'a [u8]> {
         &mut self.input
     }
 
@@ -330,8 +368,19 @@ impl<R: Read> SwfRead<R> for Reader<R> {
     }
 }
 
-impl<R: Read> Reader<R> {
-    pub fn new(input: R, version: u8) -> Reader<R> {
+impl<'a> Reader<'a> {
+    pub fn new(input: &'a [u8], version: u8) -> Reader {
+        Reader {
+            input: Cursor::new(input),
+            version,
+            byte: 0,
+            bit_index: 0,
+            num_fill_bits: 0,
+            num_line_bits: 0,
+        }
+    }
+
+    pub fn new_with_cursor(input: Cursor<&'a [u8]>, version: u8) -> Reader {
         Reader {
             input,
             version,
@@ -347,23 +396,42 @@ impl<R: Read> Reader<R> {
     }
 
     /// Returns a reference to the underlying `Reader`.
-    pub fn get_ref(&self) -> &R {
-        &self.input
+    pub fn get_ref(&self) -> &[u8] {
+        &self.input.get_ref()
     }
 
     /// Returns a mutable reference to the underlying `Reader`.
     ///
     /// Reading from this reference is not recommended.
-    pub fn get_mut(&mut self) -> &mut R {
+    pub fn get_mut(&mut self) -> &mut Cursor<&'a [u8]> {
         &mut self.input
+    }
+
+    pub fn read_slice(&mut self, length: usize) -> Result<&[u8]> {
+        let cursor_position = self.input.position() as usize;
+        match self
+            .input
+            .get_ref()
+            .get(cursor_position..cursor_position + length)
+        {
+            Some(slice) => {
+                self.input.set_position((cursor_position + length) as u64);
+                Ok(slice)
+            }
+            None => Err(Error::invalid_data("slice too small")),
+        }
     }
 
     /// Reads the next SWF tag from the stream.
     /// # Example
     /// ```
+    /// use swf::read::Reader;
+    ///
     /// let data = std::fs::read("tests/swfs/DefineSprite.swf").unwrap();
-    /// let mut swf_stream = swf::read_swf_header(&data[..]).unwrap();
-    /// while let Ok(tag) = swf_stream.reader.read_tag() {
+    /// let (header, data) = swf::read_swf_header(&data[..]).unwrap().read_all().unwrap();
+    /// let version = header.version;
+    /// let mut reader = Reader::new(&data, version);
+    /// while let Ok(tag) = reader.read_tag() {
     ///     println!("Tag: {:?}", tag);
     /// }
     /// ```
@@ -379,7 +447,9 @@ impl<R: Read> Reader<R> {
     }
 
     fn read_tag_with_code(&mut self, tag_code: u16, length: usize) -> Result<Tag> {
-        let mut tag_reader = Reader::new(self.input.by_ref().take(length as u64), self.version);
+        let version = self.version;
+        let mut tag_reader = Reader::new(self.read_slice(length)?, version);
+
         use crate::tag_code::TagCode;
         let tag = match TagCode::from_u16(tag_code) {
             Some(TagCode::End) => Tag::End,
@@ -621,9 +691,11 @@ impl<R: Read> Reader<R> {
                 // TODO: There's probably a better way to prevent the infinite type recursion.
                 // Tags can only be nested one level deep, so perhaps I can implement
                 // read_tag_list for Reader<Take<R>> to enforce this.
-                let mut sprite_reader =
-                    Reader::new(&mut tag_reader.input as &mut dyn Read, self.version);
-                sprite_reader.read_define_sprite()?
+
+                let mut sprite_reader = Reader::new_with_cursor(tag_reader.input, version);
+                let tag = sprite_reader.read_define_sprite()?;
+                tag_reader.input = sprite_reader.input;
+                tag
             }
 
             Some(TagCode::PlaceObject) => {
@@ -672,7 +744,7 @@ impl<R: Read> Reader<R> {
         Ok(tag)
     }
 
-    pub fn read_compression_type(mut input: R) -> Result<Compression> {
+    pub fn read_compression_type(mut input: impl Read) -> Result<Compression> {
         let mut signature = [0u8; 3];
         input.read_exact(&mut signature)?;
         let compression = match &signature {
@@ -943,7 +1015,7 @@ impl<R: Read> Reader<R> {
 
         // We don't know how many color transforms this tag will contain, so read it into a buffer.
         let version = self.version;
-        let mut reader = Reader::new(self.get_inner().by_ref().take(tag_length as u64), version);
+        let mut reader = Reader::new(self.read_slice(tag_length)?, version);
 
         let id = reader.read_character_id()?;
         let mut color_transforms = Vec::new();
@@ -2852,7 +2924,7 @@ pub mod tests {
     use std::io::{Cursor, Read};
     use std::vec::Vec;
 
-    fn reader(data: &[u8]) -> Reader<&[u8]> {
+    fn reader(data: &[u8]) -> Reader<'_> {
         let default_version = 13;
         Reader::new(data, default_version)
     }
@@ -2861,7 +2933,8 @@ pub mod tests {
         let mut file = File::open(path).unwrap();
         let mut data = Vec::new();
         file.read_to_end(&mut data).unwrap();
-        read_swf(&data[..]).unwrap()
+        let (header, swf_data) = read_swf_header(&data[..]).unwrap().read_all().unwrap();
+        read_swf(header, &swf_data).unwrap()
     }
 
     pub fn read_tag_bytes_from_file_with_index(
@@ -2877,18 +2950,21 @@ pub mod tests {
         let mut data = Vec::new();
         file.read_to_end(&mut data).unwrap();
 
-        // Halfway parse the SWF file until we find the tag we're searching for.
-        let swf_stream = super::read_swf_header(&data[..]).unwrap();
-        let mut reader = swf_stream.reader;
+        // Read the whole SWF into memory.
+        let (header, data) = super::read_swf_header(&data[..])
+            .unwrap()
+            .read_all()
+            .unwrap();
 
-        let mut data = Vec::new();
-        reader.input.read_to_end(&mut data).unwrap();
-        let mut cursor = Cursor::new(data);
+        // Halfway parse the SWF file until we find the tag we're searching for.
+        let mut cursor = Cursor::new(&data[..]);
         loop {
             let pos = cursor.position();
             let (swf_tag_code, length) = {
-                let mut tag_reader = Reader::new(&mut cursor, swf_stream.header.version);
-                tag_reader.read_tag_code_and_length().unwrap()
+                let mut tag_reader = Reader::new_with_cursor(cursor, header.version);
+                let tuple = tag_reader.read_tag_code_and_length().unwrap();
+                cursor = tag_reader.input;
+                tuple
             };
             let tag_header_length = cursor.position() - pos;
             let mut data = Vec::new();
@@ -2947,7 +3023,7 @@ pub mod tests {
     #[test]
     fn read_invalid_swf() {
         let junk = [0u8; 128];
-        let result = read_swf(&junk[..]);
+        let result = read_swf_header(&junk[..]);
         // TODO: Verify correct error.
         assert!(result.is_err());
     }

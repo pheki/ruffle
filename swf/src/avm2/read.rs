@@ -874,7 +874,11 @@ pub mod tests {
         let mut file = File::open(path).unwrap();
         let mut data = Vec::new();
         file.read_to_end(&mut data).unwrap();
-        let swf = crate::read_swf(&data[..]).unwrap();
+        let (header, data) = crate::read_swf_header(&data[..])
+            .unwrap()
+            .read_all()
+            .unwrap();
+        let swf = crate::read_swf(header, &data[..]).unwrap();
         for tag in swf.tags {
             if let Tag::DoAbc(do_abc) = tag {
                 return do_abc.data;
